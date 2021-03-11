@@ -250,6 +250,64 @@ func (dmp *DiffMatchPatch) diffLineMode(text1, text2 []rune, deadline time.Time)
 	return diffs[:len(diffs)-1] // Remove the dummy entry at the end.
 }
 
+// diffWordMode does a quick line-level diff on both []runes, then rediff the parts for greater accuracy. This speedup can produce non-minimal diffs.
+func (dmp *DiffMatchPatch) diffWordMode(text1, text2 []rune, deadline time.Time) []Diff {
+	// Scan the text on a line-by-line basis first.
+	text1, text2, wordArray := dmp.DiffWordsToRunes(string(text1), string(text2))
+
+	diffs := dmp.diffMainRunes(text1, text2, false, deadline)
+
+	// Convert the diff back to original text.
+	diffs = dmp.DiffCharsToLines(diffs, wordArray)
+	// Eliminate freak matches (e.g. blank lines)
+	diffs = dmp.DiffCleanupSemantic(diffs)
+
+	// Rediff any replacement blocks, this time character-by-character.
+	// Add a dummy entry at the end.
+	diffs = append(diffs, Diff{DiffEqual, ""})
+
+	pointer := 0
+	countDelete := 0
+	countInsert := 0
+
+	// NOTE: Rune slices are slower than using strings in this case.
+	textDelete := ""
+	textInsert := ""
+
+	for pointer < len(diffs) {
+		switch diffs[pointer].Type {
+		case DiffInsert:
+			countInsert++
+			textInsert += diffs[pointer].Text
+		case DiffDelete:
+			countDelete++
+			textDelete += diffs[pointer].Text
+		case DiffEqual:
+			// Upon reaching an equality, check for prior redundancies.
+			if countDelete >= 1 && countInsert >= 1 {
+				// Delete the offending records and add the merged ones.
+				diffs = splice(diffs, pointer-countDelete-countInsert,
+					countDelete+countInsert)
+
+				pointer = pointer - countDelete - countInsert
+				a := dmp.diffMainRunes([]rune(textDelete), []rune(textInsert), false, deadline)
+				for j := len(a) - 1; j >= 0; j-- {
+					diffs = splice(diffs, pointer, 0, a[j])
+				}
+				pointer = pointer + len(a)
+			}
+
+			countInsert = 0
+			countDelete = 0
+			textDelete = ""
+			textInsert = ""
+		}
+		pointer++
+	}
+
+	return diffs[:len(diffs)-1] // Remove the dummy entry at the end.
+}
+
 // DiffBisect finds the 'middle snake' of a diff, split the problem in two and return the recursively constructed diff.
 // If an invalid UTF-8 sequence is encountered, it will be replaced by the Unicode replacement character.
 // See Myers 1986 paper: An O(ND) Difference Algorithm and Its Variations.
@@ -396,9 +454,22 @@ func (dmp *DiffMatchPatch) DiffLinesToChars(text1, text2 string) (string, string
 	return chars1, chars2, lineArray
 }
 
+// DiffLinesToWords splits two texts into a list of strings, and educes the texts to a string of hashes where each Unicode character represents one line.
+// It's slightly faster to call DiffLinesToRunes first, followed by DiffMainRunes.
+func (dmp *DiffMatchPatch) DiffLinesToWords(text1, text2 string) (string, string, []string) {
+	chars1, chars2, lineArray := dmp.diffWordsToStrings(text1, text2)
+	return chars1, chars2, lineArray
+}
+
 // DiffLinesToRunes splits two texts into a list of runes.
 func (dmp *DiffMatchPatch) DiffLinesToRunes(text1, text2 string) ([]rune, []rune, []string) {
 	chars1, chars2, lineArray := dmp.diffLinesToStrings(text1, text2)
+	return []rune(chars1), []rune(chars2), lineArray
+}
+
+// DiffWordsToRunes splits two texts into a list of runes.
+func (dmp *DiffMatchPatch) DiffWordsToRunes(text1, text2 string) ([]rune, []rune, []string) {
+	chars1, chars2, lineArray := dmp.diffWordsToStrings(text1, text2)
 	return []rune(chars1), []rune(chars2), lineArray
 }
 
@@ -1345,6 +1416,53 @@ func (dmp *DiffMatchPatch) diffLinesToStringsMunge(text string, lineArray *[]str
 			*lineArray = append(*lineArray, line)
 			lineHash[line] = len(*lineArray) - 1
 			strs = append(strs, uint32(len(*lineArray)-1))
+		}
+	}
+
+	return strs
+}
+
+// diffWordsToStrings splits two texts into a list of strings. Each string represents one line.
+func (dmp *DiffMatchPatch) diffWordsToStrings(text1, text2 string) (string, string, []string) {
+	// '\x00' is a valid character, but various debuggers don't like it. So we'll insert a junk entry to avoid generating a null character.
+	wordArray := []string{""} // e.g. wordArray[4] == 'Hello\n'
+
+	//Each string has the index of wordArray which it points to
+	strIndexArray1 := dmp.diffWordsToStringsMunge(text1, &wordArray)
+	strIndexArray2 := dmp.diffWordsToStringsMunge(text2, &wordArray)
+
+	return intArrayToString(strIndexArray1), intArrayToString(strIndexArray2), wordArray
+}
+
+// diffWordsToStringsMunge splits a text into an array of strings, and reduces the texts to a []string.
+func (dmp *DiffMatchPatch) diffWordsToStringsMunge(text string, wordArray *[]string) []uint32 {
+	// Walk the text, pulling out a substring for each line. text.split('\n') would would temporarily double our memory footprint. Modifying text would create many large strings to garbage collect.
+	lineHash := map[string]int{} // e.g. lineHash['Hello\n'] == 4
+	lineStart := 0
+	lineEnd := -1
+	strs := []uint32{}
+
+	for lineEnd < len(text)-1 {
+		lineEnd = indexOf(text, "\n", lineStart)
+		nextSpace := indexOf(text, " ", lineStart)
+		if nextSpace != -1 {
+			lineEnd = nextSpace
+		}
+
+		if lineEnd == -1 {
+			lineEnd = len(text) - 1
+		}
+
+		line := text[lineStart : lineEnd+1]
+		lineStart = lineEnd + 1
+		lineValue, ok := lineHash[line]
+
+		if ok {
+			strs = append(strs, uint32(lineValue))
+		} else {
+			*wordArray = append(*wordArray, line)
+			lineHash[line] = len(*wordArray) - 1
+			strs = append(strs, uint32(len(*wordArray)-1))
 		}
 	}
 
